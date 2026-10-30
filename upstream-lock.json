@@ -1,0 +1,10 @@
+{
+  "MusePose": {
+    "url": "https://github.com/TMElyralab/MusePose.git",
+    "revision": "61c52bd937224a614b3951419b735b639397cb62"
+  },
+  "Dormant": {
+    "url": "https://github.com/Manu21JC/Dormant.git",
+    "revision": "5b952757011b8b0030609bdeefb6da22028ed4d6"
+  }
+}

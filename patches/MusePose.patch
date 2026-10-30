@@ -1,0 +1,396 @@
+diff --git a/musepose/utils/util.py b/musepose/utils/util.py
+index 28fc6ef..0309beb 100644
+--- a/musepose/utils/util.py
++++ b/musepose/utils/util.py
+@@ -10,7 +10,7 @@ import numpy as np
+ import torch
+ import torchvision
+ from einops import rearrange
+-from PIL import Image
++from PIL import Image, ImageOps
+ 
+ 
+ def seed_everything(seed):
+@@ -60,8 +60,14 @@ def save_videos_from_pil(pil_images, path, fps=8):
+         container = av.open(path, "w")
+         stream = container.add_stream(codec, rate=fps)
+ 
+-        stream.width = width
+-        stream.height = height
++        # libx264/yuv420p requires even dimensions. Keep the model input at
++        # its exact reference-image size, and add at most one black border
++        # pixel only to the exported result when an input dimension is odd.
++        output_width = width + (width % 2)
++        output_height = height + (height % 2)
++
++        stream.width = output_width
++        stream.height = output_height
+         stream.pix_fmt = 'yuv420p'
+         stream.bit_rate = 10000000   
+         stream.options["crf"] = "18"
+@@ -70,6 +76,12 @@ def save_videos_from_pil(pil_images, path, fps=8):
+ 
+         for pil_image in pil_images:
+             # pil_image = Image.fromarray(image_arr).convert("RGB")
++            if pil_image.size != (output_width, output_height):
++                pil_image = ImageOps.expand(
++                    pil_image.convert("RGB"),
++                    border=(0, 0, output_width - pil_image.width, output_height - pil_image.height),
++                    fill=(0, 0, 0),
++                )
+             av_frame = av.VideoFrame.from_image(pil_image)
+             container.mux(stream.encode(av_frame))
+         container.mux(stream.encode())
+diff --git a/run_uploaded_musepose.py b/run_uploaded_musepose.py
+new file mode 100644
+--- /dev/null
++++ b/run_uploaded_musepose.py
+@@ -0,0 +1,171 @@
++import argparse
++import json
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++import av
++from PIL import Image
++from face_pose_alignment import (
++    FaceDetector, PersonDetector, select_face, select_person,
++    face_inside_person, fill_missing_boxes, align_pose, align_frame,
++)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--reference", required=True)
++    parser.add_argument("--driving", required=True)
++    parser.add_argument("--pose_out", required=True)
++    parser.add_argument("--aligned_driving_out", required=True)
++    parser.add_argument(
++        "--control_parts",
++        choices=("body", "body_hand", "full"),
++        default="body_hand",
++        help="Pose parts to draw into the control video.",
++    )
++    args = parser.parse_args()
++
++    reference_path = Path(args.reference)
++    if not reference_path.is_file():
++        raise FileNotFoundError(f"参考图片不存在: {reference_path}")
++    with Image.open(reference_path) as reference_image:
++        target_width, target_height = reference_image.convert("RGB").size
++    if target_width < 1 or target_height < 1:
++        raise ValueError("参考图片尺寸无效。")
++    print(f"pose output size: {target_width}x{target_height}")
++
++    repo = Path(__file__).resolve().parent
++    sys.path.insert(0, str(repo))
++
++    from pose.script.tool import get_fps, read_frames
++
++    # Use the ONNX DWPose implementation bundled with Dormant.  The original
++    # MusePose path imports mmcv/mmpose/mmdet, which are optional and may not
++    # be installed in the inference environment.
++    dormant_root = Path(os.environ.get("PHOTO_PROJECT_ROOT", str(repo.parent))) / "Dormant"
++    if not (dormant_root / "pretrained_weights/DWPose/yolox_l.onnx").exists():
++        raise FileNotFoundError(
++            "Dormant ONNX DWPose 权重不存在: "
++            f"{dormant_root / 'pretrained_weights/DWPose/yolox_l.onnx'}"
++        )
++    if not (dormant_root / "pretrained_weights/DWPose/dw-ll_ucoco_384.onnx").exists():
++        raise FileNotFoundError(
++            "Dormant ONNX DWPose 权重不存在: "
++            f"{dormant_root / 'pretrained_weights/DWPose/dw-ll_ucoco_384.onnx'}"
++        )
++
++    sys.path.insert(0, str(dormant_root))
++    from model_lib.dwpose import DWposeDetector
++    previous_cwd = Path.cwd()
++    os.chdir(dormant_root)
++    try:
++        detector = DWposeDetector().to(
++            "cuda" if torch.cuda.is_available() else "cpu"
++        )
++    finally:
++        os.chdir(previous_cwd)
++
++    frames = read_frames(args.driving)
++    fps = get_fps(args.driving)
++    if not frames:
++        raise RuntimeError("驱动视频没有可读取的视频帧。")
++    face_detector = FaceDetector(str(Path(os.environ.get("YOLOFACE_MODEL", str(repo.parent / "models/yolo/yoloface_8n.onnx")))))
++    person_detector = PersonDetector(str(Path(os.environ.get("YOLO_PERSON_MODEL", str(repo.parent / "models/yolo/yolov8n.pt")))))
++    with Image.open(reference_path) as image:
++        reference_people = person_detector.detect(image)
++        reference_person = select_person(reference_people)
++        reference_faces = face_detector.detect(image)
++        reference_bbox = select_face(
++            [face for face in reference_faces if face_inside_person(face, reference_person)]
++            or reference_faces
++        )
++    if reference_bbox is None:
++        raise RuntimeError("参考图片未检测到人脸，无法进行人脸对齐。")
++    if reference_person is None:
++        raise RuntimeError("参考图片未检测到人物，无法进行人物和人脸对齐。")
++    print(f"YOLO person reference bbox: {reference_person.tolist()}", flush=True)
++    print(f"YOLOFace reference face bbox: {reference_bbox.tolist()}", flush=True)
++    face_boxes = []
++    person_boxes = []
++    previous_face = None
++    previous_person = reference_person
++    for frame in frames:
++        people = person_detector.detect(frame)
++        person = select_person(people, previous_person)
++        faces = face_detector.detect(frame)
++        scoped_faces = [face for face in faces if face_inside_person(face, person)]
++        box = select_face(scoped_faces or faces, previous_face)
++        person_boxes.append(person)
++        face_boxes.append(box)
++        if person is not None:
++            previous_person = person
++        if box is not None:
++            previous_face = box
++    if not any(person is not None for person in person_boxes):
++        raise RuntimeError("驱动视频未检测到人物，无法进行人物和人脸对齐。")
++    filled_boxes = fill_missing_boxes(face_boxes)
++    filled_person_boxes = fill_missing_boxes(person_boxes)
++    print(f"YOLO person detected: {sum(b is not None for b in person_boxes)}/{len(frames)}", flush=True)
++    print(f"YOLOFace detected faces: {sum(b is not None for b in face_boxes)}/{len(frames)}", flush=True)
++    diagnostics = {"reference_person": reference_person.tolist(), "reference_face": reference_bbox.tolist(),
++                   "target_size": [target_width, target_height], "frames": []}
++    pose_frames = []
++    aligned_frames = []
++    for index, frame in enumerate(frames):
++        aligned_frame, frame_matrix = align_frame(frame, filled_boxes[index], reference_bbox,
++                                                   (target_width, target_height))
++        aligned_frames.append(Image.fromarray(aligned_frame))
++        detected_map, _ = detector(
++            aligned_frames[-1],
++            detect_resolution=1024,
++            image_resolution=768,
++            output_type="pil",
++            control_parts=args.control_parts,
++        )
++        # DWPose already runs on the aligned RGB frame. Keep a final exact-size
++        # canvas pass so its rendered skeleton and the driving frame coincide.
++        pose_frames.append(detected_map.resize((target_width, target_height), Image.Resampling.BILINEAR))
++        diagnostics["frames"].append({"frame": index, "person_detected": person_boxes[index] is not None,
++                                      "person_box": filled_person_boxes[index].tolist(),
++                                      "face_detected": face_boxes[index] is not None,
++                                      "source_face": filled_boxes[index].tolist(), "transform": frame_matrix.tolist()})
++        if index % 20 == 0:
++            print(f"face-aligned pose frames: {index + 1}/{len(frames)}", flush=True)
++
++    if not pose_frames:
++        raise RuntimeError("驱动视频没有可读取的视频帧。")
++    # Keep the exact reference-image dimensions.  yuv420p/libx264 requires
++    # even dimensions, so use yuv444p for odd-sized inputs such as 805x1440.
++    os.makedirs(Path(args.pose_out).parent, exist_ok=True)
++    Path(args.pose_out).with_suffix(".alignment.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
++    aligned_container = av.open(str(args.aligned_driving_out), "w")
++    aligned_stream = aligned_container.add_stream("libx264", rate=int(np.around(float(fps))))
++    aligned_stream.width = target_width
++    aligned_stream.height = target_height
++    aligned_stream.pix_fmt = "yuv444p"
++    aligned_stream.options["crf"] = "18"
++    try:
++        for aligned_frame in aligned_frames:
++            aligned_container.mux(aligned_stream.encode(av.VideoFrame.from_image(aligned_frame)))
++        aligned_container.mux(aligned_stream.encode())
++    finally:
++        aligned_container.close()
++    container = av.open(str(args.pose_out), "w")
++    stream = container.add_stream("libx264", rate=int(np.around(float(fps))))
++    stream.width = target_width
++    stream.height = target_height
++    stream.pix_fmt = "yuv444p"
++    stream.options["crf"] = "18"
++    try:
++        for pose_frame in pose_frames:
++            container.mux(stream.encode(av.VideoFrame.from_image(pose_frame)))
++        container.mux(stream.encode())
++    finally:
++        container.close()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/face_pose_alignment.py b/face_pose_alignment.py
+new file mode 100644
+--- /dev/null
++++ b/face_pose_alignment.py
+@@ -0,0 +1,130 @@
++from pathlib import Path
++
++import cv2
++import numpy as np
++import onnxruntime as ort
++
++
++class FaceDetector:
++    def __init__(self, model_path):
++        if not Path(model_path).is_file():
++            raise FileNotFoundError(f"Face detector weights missing: {model_path}")
++        options = ort.SessionOptions()
++        options.intra_op_num_threads = 1
++        self.session = ort.InferenceSession(
++            str(model_path), sess_options=options, providers=["CPUExecutionProvider"]
++        )
++
++    def detect(self, image):
++        # Match the local FaceFusion YOLOFace BGR/top-left padding convention.
++        frame = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
++        height, width = frame.shape[:2]
++        ratio = min(1.0, 640 / width, 640 / height)
++        small = cv2.resize(frame, (max(1, int(width * ratio)), max(1, int(height * ratio))))
++        canvas = np.zeros((640, 640, 3), dtype=np.float32)
++        h, w = small.shape[:2]
++        canvas[:h, :w] = small
++        tensor = (canvas.transpose(2, 0, 1)[None] / 255).astype(np.float32)
++        rows = np.squeeze(self.session.run(None, {"input": tensor})[0]).T
++        boxes, scores = [], []
++        for row in rows[rows[:, 4] >= 0.5]:
++            cx, cy, bw, bh = row[:4]
++            x1, x2 = np.clip([(cx - bw / 2) * width / w, (cx + bw / 2) * width / w], 0, width)
++            y1, y2 = np.clip([(cy - bh / 2) * height / h, (cy + bh / 2) * height / h], 0, height)
++            if x2 > x1 and y2 > y1:
++                boxes.append([float(x1), float(y1), float(x2 - x1), float(y2 - y1)])
++                scores.append(float(row[4]))
++        keep = np.asarray(cv2.dnn.NMSBoxes(boxes, scores, 0.5, 0.4)).reshape(-1)
++        return [np.array([boxes[i][0], boxes[i][1], boxes[i][0] + boxes[i][2], boxes[i][1] + boxes[i][3]]) for i in keep]
++
++
++class PersonDetector:
++    """Ultralytics YOLO person detector used to identify the main subject."""
++
++    def __init__(self, model_path, device="cpu"):
++        try:
++            from ultralytics import YOLO
++        except ImportError as exc:
++            raise RuntimeError("人物 YOLO 检测需要 ultralytics。") from exc
++        self.model = YOLO(str(model_path))
++        self.device = device
++
++    def detect(self, image):
++        result = self.model.predict(
++            source=np.asarray(image.convert("RGB")),
++            classes=[0],
++            conf=0.25,
++            iou=0.5,
++            device=self.device,
++            verbose=False,
++        )[0]
++        if result.boxes is None or len(result.boxes) == 0:
++            return []
++        return [box.detach().cpu().numpy().astype(np.float64) for box in result.boxes.xyxy]
++
++
++def select_face(boxes, previous=None):
++    if not boxes:
++        return None
++    if previous is None:
++        return max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
++    center = (previous[:2] + previous[2:]) / 2
++    return min(boxes, key=lambda b: np.linalg.norm((b[:2] + b[2:]) / 2 - center))
++
++
++def select_person(boxes, previous=None):
++    if not boxes:
++        return None
++    if previous is None:
++        return max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
++    center = (previous[:2] + previous[2:]) / 2
++    return min(boxes, key=lambda b: np.linalg.norm((b[:2] + b[2:]) / 2 - center))
++
++
++def face_inside_person(face, person):
++    if face is None or person is None:
++        return False
++    center = (face[:2] + face[2:]) / 2
++    return bool(person[0] <= center[0] <= person[2] and person[1] <= center[1] <= person[3])
++
++
++def fill_missing_boxes(boxes, max_gap=12):
++    valid = [i for i, box in enumerate(boxes) if box is not None]
++    if not valid:
++        raise RuntimeError("驱动视频未检测到人脸，无法进行人脸对齐。")
++    gaps = [valid[0], len(boxes) - 1 - valid[-1]] + [b - a - 1 for a, b in zip(valid, valid[1:])]
++    if max(gaps) > max_gap:
++        raise RuntimeError(f"驱动视频连续漏检人脸超过 {max_gap} 帧，请更换清晰的驱动视频。")
++    values = np.stack([boxes[i] for i in valid])
++    return np.stack([np.interp(np.arange(len(boxes)), valid, values[:, j]) for j in range(4)], axis=1)
++
++
++def align_pose(pose_image, source_box, reference_box, source_size, target_size):
++    source_box = np.asarray(source_box, dtype=np.float64).copy()
++    source_box[[0, 2]] *= pose_image.width / source_size[0]
++    source_box[[1, 3]] *= pose_image.height / source_size[1]
++    source_center = (source_box[:2] + source_box[2:]) / 2
++    target_center = (reference_box[:2] + reference_box[2:]) / 2
++    source_extent = source_box[2:] - source_box[:2]
++    target_extent = reference_box[2:] - reference_box[:2]
++    scale = float(np.sqrt(np.prod(target_extent) / np.prod(source_extent)))
++    offset = target_center - scale * source_center
++    matrix = np.array([[scale, 0, offset[0]], [0, scale, offset[1]]], dtype=np.float64)
++    aligned = cv2.warpAffine(np.asarray(pose_image.convert("RGB")), matrix, target_size,
++                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
++    return aligned, matrix
++
++
++def align_frame(frame, source_box, reference_box, target_size):
++    """Align the complete RGB driving frame using its face as the anchor."""
++    source_box = np.asarray(source_box, dtype=np.float64)
++    source_center = (source_box[:2] + source_box[2:]) / 2
++    target_center = (np.asarray(reference_box[:2]) + np.asarray(reference_box[2:])) / 2
++    source_extent = source_box[2:] - source_box[:2]
++    target_extent = np.asarray(reference_box[2:]) - np.asarray(reference_box[:2])
++    scale = float(np.sqrt(np.prod(target_extent) / np.prod(source_extent)))
++    offset = target_center - scale * source_center
++    matrix = np.array([[scale, 0, offset[0]], [0, scale, offset[1]]], dtype=np.float64)
++    aligned = cv2.warpAffine(np.asarray(frame.convert("RGB")), matrix, target_size,
++                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
++    return aligned, matrix
+diff --git a/test_face_pose_alignment.py b/test_face_pose_alignment.py
+new file mode 100644
+--- /dev/null
++++ b/test_face_pose_alignment.py
+@@ -0,0 +1,37 @@
++import unittest
++
++import numpy as np
++from PIL import Image
++
++from face_pose_alignment import align_pose, fill_missing_boxes, select_face
++
++
++class FaceAlignmentTests(unittest.TestCase):
++    def test_whole_body_and_face_center(self):
++        pixels = np.zeros((100, 100, 3), dtype=np.uint8)
++        pixels[65:70, 45:50] = 255
++        face = np.array([40, 10, 60, 30])
++        target = np.array([70, 20, 110, 60])
++        result, matrix = align_pose(Image.fromarray(pixels), face, target, (100, 100), (200, 200))
++        np.testing.assert_allclose(matrix @ [50, 20, 1], [90, 40])
++        self.assertEqual(matrix[0, 0], matrix[1, 1])
++        self.assertGreater(result[135, 85].max(), 0)
++        self.assertEqual(result[0, 0].max(), 0)
++        self.assertEqual(result.shape, (200, 200, 3))
++
++    def test_missing_faces(self):
++        box = np.array([10, 10, 20, 20])
++        filled = fill_missing_boxes([box, None, box + 2])
++        np.testing.assert_allclose(filled[1], box + 1)
++        with self.assertRaises(RuntimeError):
++            fill_missing_boxes([None] * 20)
++        with self.assertRaises(RuntimeError):
++            fill_missing_boxes([box] + [None] * 13)
++
++    def test_tracking(self):
++        box = np.array([10, 10, 20, 20])
++        np.testing.assert_array_equal(select_face([box + 100, box + 1], box), box + 1)
++
++
++if __name__ == "__main__":
++    unittest.main()

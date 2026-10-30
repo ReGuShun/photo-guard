@@ -1,0 +1,4 @@
+gradio==5.50.0
+imageio==2.37.4
+numpy>=1.26,<3
+Pillow>=10,<12

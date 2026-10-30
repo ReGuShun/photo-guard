@@ -1,0 +1,250 @@
+diff --git a/configs/cldm_v15_reference_only_pose.yaml b/configs/cldm_v15_reference_only_pose.yaml
+index 2c5a0b5..dd2457f 100644
+--- a/configs/cldm_v15_reference_only_pose.yaml
++++ b/configs/cldm_v15_reference_only_pose.yaml
+@@ -95,3 +95,7 @@ model:
+ 
+     cond_stage_config:
+       target: model_lib.ControlNet.ldm.modules.encoders.modules.FrozenCLIPEmbedder
++      params:
++        version: "./pretrained_weights/stable-diffusion-v1-5"
++        tokenizer_subfolder: "tokenizer"
++        text_encoder_subfolder: "text_encoder"
+diff --git a/configs/inference_v2.yaml b/configs/inference_v2.yaml
+index d613dca..b9c8821 100644
+--- a/configs/inference_v2.yaml
++++ b/configs/inference_v2.yaml
+@@ -18,7 +18,7 @@ unet_additional_kwargs:
+     - Temporal_Self
+     - Temporal_Self
+     temporal_position_encoding: true
+-    temporal_position_encoding_max_len: 32
++    temporal_position_encoding_max_len: 128
+     temporal_attention_dim_div: 1
+ 
+ noise_scheduler_kwargs:
+@@ -32,4 +32,4 @@ noise_scheduler_kwargs:
+   rescale_betas_zero_snr: True
+   timestep_spacing: "trailing"
+ 
+-sampler: DDIM 
+\ No newline at end of file
++sampler: DDIM
+diff --git a/model_lib/ControlNet/ldm/modules/attention.py b/model_lib/ControlNet/ldm/modules/attention.py
+index 813deff..ccd6911 100644
+--- a/model_lib/ControlNet/ldm/modules/attention.py
++++ b/model_lib/ControlNet/ldm/modules/attention.py
+@@ -216,7 +216,7 @@ class MemoryEfficientCrossAttention(nn.Module):
+         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+ 
+         self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+-        self.attention_op: Optional[Any] = None
++        self.attention_op: Optional[Any] = xformers.ops.MemoryEfficientAttentionCutlassOp
+         self.checkpoint = checkpoint
+ 
+     def forward(self, x, context=None):
+diff --git a/model_lib/ControlNet/ldm/modules/encoders/modules.py b/model_lib/ControlNet/ldm/modules/encoders/modules.py
+index b8e8b75..9cf123f 100644
+--- a/model_lib/ControlNet/ldm/modules/encoders/modules.py
++++ b/model_lib/ControlNet/ldm/modules/encoders/modules.py
+@@ -95,11 +95,11 @@ class FrozenCLIPEmbedder(AbstractEncoder):
+         "hidden"
+     ]
+     def __init__(self, version="openai/clip-vit-large-patch14", device="cuda", max_length=77,
+-                 freeze=True, layer="last", layer_idx=None):  # clip-vit-base-patch32
++                 freeze=True, layer="last", layer_idx=None, tokenizer_subfolder="", text_encoder_subfolder=""):  # clip-vit-base-patch32
+         super().__init__()
+         assert layer in self.LAYERS
+-        self.tokenizer = CLIPTokenizer.from_pretrained(version)
+-        self.transformer = CLIPTextModel.from_pretrained(version)
++        self.tokenizer = CLIPTokenizer.from_pretrained(version, subfolder=tokenizer_subfolder)
++        self.transformer = CLIPTextModel.from_pretrained(version, subfolder=text_encoder_subfolder)
+         self.device = device
+         self.max_length = max_length
+         if freeze:
+diff --git a/model_lib/dwpose/__init__.py b/model_lib/dwpose/__init__.py
+index a217b0b..5bad33c 100644
+--- a/model_lib/dwpose/__init__.py
++++ b/model_lib/dwpose/__init__.py
+@@ -19,7 +19,9 @@ from . import util
+ from .wholebody import Wholebody
+ 
+ 
+-def draw_pose(pose, H, W):
++def draw_pose(pose, H, W, control_parts="full"):
++    if control_parts not in {"body", "body_hand", "full"}:
++        raise ValueError(f"Unsupported control_parts: {control_parts}")
+     bodies = pose["bodies"]
+     faces = pose["faces"]
+     hands = pose["hands"]
+@@ -29,9 +31,11 @@ def draw_pose(pose, H, W):
+ 
+     canvas = util.draw_bodypose(canvas, candidate, subset)
+ 
+-    canvas = util.draw_handpose(canvas, hands)
++    if control_parts in {"body_hand", "full"}:
++        canvas = util.draw_handpose(canvas, hands)
+ 
+-    canvas = util.draw_facepose(canvas, faces)
++    if control_parts == "full":
++        canvas = util.draw_facepose(canvas, faces)
+ 
+     return canvas
+ 
+@@ -65,6 +69,7 @@ class DWposeDetector:
+         detect_resolution=512,
+         image_resolution=512,
+         output_type="pil",
++        control_parts="full",
+         **kwargs,
+     ):
+         input_image = cv2.cvtColor(
+@@ -107,7 +112,7 @@ class DWposeDetector:
+             bodies = dict(candidate=body, subset=score)
+             pose = dict(bodies=bodies, hands=hands, faces=faces)
+ 
+-            detected_map = draw_pose(pose, H, W)
++            detected_map = draw_pose(pose, H, W, control_parts=control_parts)
+             detected_map = HWC3(detected_map)
+ 
+             img = resize_image(input_image, image_resolution)
+diff --git a/model_lib/models/appearance_encoder.py b/model_lib/models/appearance_encoder.py
+index 4b5a234..20e55b0 100644
+--- a/model_lib/models/appearance_encoder.py
++++ b/model_lib/models/appearance_encoder.py
+@@ -48,14 +48,25 @@ from diffusers.models.embeddings import (
+     TimestepEmbedding,
+     Timesteps,
+ )
+-from diffusers.models.embeddings import GLIGENTextBoundingboxProjection as PositionNet
++try:
++    from diffusers.models.embeddings import GLIGENTextBoundingboxProjection as PositionNet
++except ImportError:
++    from diffusers.models.embeddings import PositionNet
+ from diffusers.models.modeling_utils import ModelMixin
+-from diffusers.models.unets.unet_2d_blocks import (
+-    UNetMidBlock2DCrossAttn,
+-    UNetMidBlock2DSimpleCrossAttn,
+-    get_down_block,
+-    get_up_block,
+-)
++try:
++    from diffusers.models.unets.unet_2d_blocks import (
++        UNetMidBlock2DCrossAttn,
++        UNetMidBlock2DSimpleCrossAttn,
++        get_down_block,
++        get_up_block,
++    )
++except ModuleNotFoundError:
++    from diffusers.models.unet_2d_blocks import (
++        UNetMidBlock2DCrossAttn,
++        UNetMidBlock2DSimpleCrossAttn,
++        get_down_block,
++        get_up_block,
++    )
+ 
+ 
+ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+@@ -1064,4 +1075,4 @@ class AppearanceEncoderModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixi
+         if not return_dict:
+             return (sample,)
+ 
+-        return UNet2DConditionOutput(sample=sample)
+\ No newline at end of file
++        return UNet2DConditionOutput(sample=sample)
+diff --git a/model_lib/models/transformer_2d.py b/model_lib/models/transformer_2d.py
+index c64f6d1..fe8b9b8 100644
+--- a/model_lib/models/transformer_2d.py
++++ b/model_lib/models/transformer_2d.py
+@@ -4,7 +4,10 @@ from typing import Any, Dict, Optional
+ 
+ import torch
+ from diffusers.configuration_utils import ConfigMixin, register_to_config
+-from diffusers.models.embeddings import PixArtAlphaTextProjection as CaptionProjection
++try:
++    from diffusers.models.embeddings import PixArtAlphaTextProjection as CaptionProjection
++except ImportError:
++    from diffusers.models.embeddings import CaptionProjection
+ from diffusers.models.lora import LoRACompatibleConv, LoRACompatibleLinear
+ from diffusers.models.modeling_utils import ModelMixin
+ from diffusers.models.normalization import AdaLayerNormSingle
+diff --git a/model_lib/models/unet_2d_blocks.py b/model_lib/models/unet_2d_blocks.py
+index 6a01cd1..2e8e3e9 100644
+--- a/model_lib/models/unet_2d_blocks.py
++++ b/model_lib/models/unet_2d_blocks.py
+@@ -6,7 +6,10 @@ import torch
+ import torch.nn.functional as F
+ from diffusers.models.activations import get_activation
+ from diffusers.models.attention_processor import Attention
+-from diffusers.models.transformers.dual_transformer_2d import DualTransformer2DModel
++try:
++    from diffusers.models.transformers.dual_transformer_2d import DualTransformer2DModel
++except ModuleNotFoundError:
++    from diffusers.models.dual_transformer_2d import DualTransformer2DModel
+ from diffusers.models.resnet import Downsample2D, ResnetBlock2D, Upsample2D
+ from diffusers.utils import is_torch_version, logging
+ from diffusers.utils.torch_utils import apply_freeu
+diff --git a/model_lib/models/unet_2d_condition.py b/model_lib/models/unet_2d_condition.py
+index cf5fcf7..2b77c45 100644
+--- a/model_lib/models/unet_2d_condition.py
++++ b/model_lib/models/unet_2d_condition.py
+@@ -15,13 +15,12 @@ from diffusers.models.attention_processor import (
+     AttnAddedKVProcessor,
+     AttnProcessor,
+ )
+-from diffusers.models.embeddings import GLIGENTextBoundingboxProjection as PositionNet
+ from diffusers.models.embeddings import (
+     GaussianFourierProjection,
+     ImageHintTimeEmbedding,
+     ImageProjection,
+     ImageTimeEmbedding,
+-    #PositionNet,
++    PositionNet,
+     TextImageProjection,
+     TextImageTimeEmbedding,
+     TextTimeEmbedding,
+diff --git a/protect_image.py b/protect_image.py
+index 4660b7d..e605341 100644
+--- a/protect_image.py
++++ b/protect_image.py
+@@ -109,9 +109,10 @@ def main():
+     )
+ 
+     if is_xformers_available():
+-        reference_unet.enable_xformers_memory_efficient_attention()
+-        denoising_unet.enable_xformers_memory_efficient_attention()
+-        appearance_encoder.enable_xformers_memory_efficient_attention()
++        from xformers.ops import MemoryEfficientAttentionCutlassOp
++        reference_unet.enable_xformers_memory_efficient_attention(attention_op=MemoryEfficientAttentionCutlassOp)
++        denoising_unet.enable_xformers_memory_efficient_attention(attention_op=MemoryEfficientAttentionCutlassOp)
++        appearance_encoder.enable_xformers_memory_efficient_attention(attention_op=MemoryEfficientAttentionCutlassOp)
+ 
+     vae.enable_tiling()
+ 
+@@ -169,4 +170,4 @@ def main():
+     protect_image_pil.save(output_path)
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/utils/pgd.py b/utils/pgd.py
+index 28b3f5a..3e721b1 100644
+--- a/utils/pgd.py
++++ b/utils/pgd.py
+@@ -205,7 +205,7 @@ class linfpgdattack():
+                     loss_consist.append(F.mse_loss(latents[i], latents[j]))
+ 
+             loss_align = sum(loss_align) / len(loss_align)
+-            loss_consist = sum(loss_consist) / len(loss_consist)
++            loss_consist = sum(loss_consist) / len(loss_consist) if loss_consist else latents.new_zeros(())
+ 
+             loss_lpips = self.lpips(x, x + delta)
+             loss_lpips = max(loss_lpips - self.eps, 0)
+@@ -338,4 +338,4 @@ def get_text_embeddings(device, do_classifier_free_guidance, prompt=[''], negati
+     del text_encoder
+     gc.collect()
+     torch.cuda.empty_cache()
+-    return text_embeddings
+\ No newline at end of file
++    return text_embeddings
